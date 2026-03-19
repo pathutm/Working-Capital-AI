@@ -31,9 +31,10 @@ SCHEMA_METADATA: List[Dict[str, Any]] = [
             {"name": "id", "description": "Primary key. Join with SalesInvoiceItem.invoice_id."},
             {"name": "invoice_no", "description": "Sales invoice number."},
             {"name": "invoice_date", "description": "Date of sale."},
+            {"name": "due_date", "description": "Payment deadline. CRITICAL for 'overdue' calculation."},
             {"name": "total_amount", "description": "Total value of the invoice. ALWAYS use this for 'most expensive' or 'total' sales questions."},
             {"name": "paid_amount", "description": "Amount already paid."},
-            {"name": "status", "description": "State: 'Pending', 'Paid', 'PartiallyPaid', 'Overdue', 'Cancelled'."},
+            {"name": "status", "description": "State: 'Pending', 'Paid', 'PartiallyPaid', 'Overdue', 'Cancelled'. 'Overdue' means status='Overdue' OR (due_date < current date)."},
             {"name": "customer_id_ref", "description": "Foreign key to Customer.customer_id (the human ID)."}
         ]
     },
@@ -44,8 +45,10 @@ SCHEMA_METADATA: List[Dict[str, Any]] = [
             {"name": "id", "description": "Primary key. Join with PurchaseInvoiceItem.invoice_id."},
             {"name": "invoice_no", "description": "Purchase invoice number."},
             {"name": "invoice_date", "description": "Date of purchase."},
+            {"name": "due_date", "description": "Payment deadline. CRITICAL for 'overdue' calculation."},
             {"name": "total_amount", "description": "Total value of the entire purchase. ALWAYS use this for 'most expensive purchase' or 'spending' questions."},
             {"name": "paid_amount", "description": "Amount we paid."},
+            {"name": "status", "description": "State: 'Pending', 'Paid', 'PartiallyPaid', 'Overdue', 'Cancelled'."},
             {"name": "vendor_id", "description": "Foreign key to Vendor.id (the UUID)."}
         ]
     },

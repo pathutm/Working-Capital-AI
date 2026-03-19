@@ -84,6 +84,7 @@ class AILogicService:
            - NEVER use 'outstanding_balance' or 'outstanding_payable' fields from Customer/Vendor tables (they may be stale).
            - ALWAYS calculate balances by summing (total_amount - paid_amount) from Invoice tables.
            - ALWAYS exclude status='Cancelled'.
+           - OVERDUE DEFINITION: An invoice is OVERDUE if "status" = 'Overdue' OR ("due_date" < CURRENT_DATE AND "status" != 'Paid' AND "status" != 'Cancelled'). This handles cases where the status flag is lagging.
         3. NAME-BASED SEARCH & JOINS (CRITICAL):
            - Invoices and Entities (Customer/Vendor) are Linked.
            - When searching for a Company Name (e.g. 'Apex'), ALWAYS JOIN the transaction table to the Entity table.
@@ -102,6 +103,10 @@ class AILogicService:
            - PLURAL RESILIENCE: If a user uses a plural word (e.g. "Steel Plates", "Aluminium Sheets"), ALWAYS use the singular stem in the SQL search (e.g. "item_name" ILIKE '%Steel%Plate%'). Singular DB records will NOT match plural search terms.
         7. SELECTION EVIDENCE (CRITICAL):
            - If the user filters by a name (e.g. Vendor Name or Item Name), you MUST include that name field in the SELECT clause (e.g. SELECT "Vendor"."company_name", ...). This allows the final response to confirm the match to the user.
+        8. OVERDUE vs OUTSTANDING (CRITICAL):
+           - If asked for "overdue", you MUST apply the date filter: ("SalesInvoice"."due_date" < CURRENT_DATE AND "SalesInvoice"."status" != 'Paid' AND "SalesInvoice"."status" != 'Cancelled') OR "SalesInvoice"."status" = 'Overdue'.
+           - If asked for "receivable" or "outstanding", sum ("total_amount" - "paid_amount") for status != 'Cancelled' AND status != 'Paid'.
+           - NEVER report total outstanding as overdue unless specifically asked for both.
         """
         
         try:
