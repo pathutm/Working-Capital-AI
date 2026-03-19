@@ -1,7 +1,7 @@
 import requests
 import json
 from app.core.config import settings
-from app.services.rag_service import rag_service
+from app.core.schema_definitions import SCHEMA_METADATA
 from app.services.db_service import db_service
 from typing import Dict, Any, List
 
@@ -12,71 +12,29 @@ class AILogicService:
         self.model = settings.MODEL_NAME
 
     def _call_llama(self, system_prompt: str, user_prompt: str) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+        import time
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.1, # Low temperature for SQL generation/logic
-            "max_tokens": 1000
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            "temperature": 0.1, "max_tokens": 1000
         }
-        response = requests.post(self.api_url, headers=headers, json=payload)
-        if response.status_code != 200:
-            print(f"Groq API Error Status: {response.status_code}")
-            print(f"Groq API Error Response: {response.text}")
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            response = requests.post(self.api_url, headers=headers, json=payload)
+            if response.status_code == 429:
+                time.sleep(2)
+                continue
+            if response.status_code != 200:
+                print(f"Groq API Error Status: {response.status_code}. Response: {response.text}")
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        raise Exception("Groq Rate Limit exceeded after retries")
 
-    def _rewrite_query(self, user_message: str, history: List[Dict[str, str]]) -> str:
-        """
-        Rewrite a follow-up query into a standalone query using conversation history.
-        Example: "what is the count" -> "What is the count of steel plates we purchased?"
-        """
-        if not history:
-            return user_message
-            
-        # Get last 3 turns for context
-        recent_history = history[-3:]
-        history_text = ""
-        for m in recent_history:
-            role = m.get('role', 'User').capitalize()
-            content = m.get('content', '')
-            history_text += f"{role}: {content}\n"
-        
-        system_rewrite_prompt = """
-        You are a query-rewriting assistant. 
-        Given a conversation history and a final follow-up question, rewrite it into a single, standalone question that contains all the necessary context from the history. 
-        If it's already a standalone question, don't change it.
-        
-        Example 1:
-        History: "How many steel plates did we buy?" AI: "We bought 50."
-        Follow-up: "what was the cost?"
-        Rewritten: "What was the cost of the steel plates we bought?"
-        
-        Return ONLY the rewritten question.
-        """
-        
-        user_prompt = f"History:\n{history_text}\n\nFinal Question: {user_message}"
-        
-        try:
-            rewritten = self._call_llama(system_rewrite_prompt, user_prompt).strip()
-            return rewritten
-        except:
-            return user_message
+    # removed _rewrite_query as per user request for direct querying
 
     async def process_chat(self, user_message: str, history: List[Dict[str, str]] = []) -> str:
-        # Step 0: Rewrite the query if there's history
-        rewritten_message = self._rewrite_query(user_message, history or [])
-        print(f"DEBUG: Standalone query: {rewritten_message}")
-
-        # Step 1: Retrieve relevant schema context via RAG
-        schema_context = rag_service.retrieve_relevant_context(rewritten_message, n_results=10)
-        schema_text = "\n".join([c["document"] for c in schema_context])
+        # Step 1: Use ENTIRE schema metadata (ensures 100% join accuracy for small schema)
+        schema_text = f"--- FULL DATABASE SCHEMA ---\n{json.dumps(SCHEMA_METADATA, indent=2)}"
 
         # Step 2: Generate SQL Query using Llama 3.3 70B
         system_sql_prompt = f"""
@@ -110,7 +68,10 @@ class AILogicService:
         - DO NOT include any preamble like "To find the...", "Here is the query...", etc.
         - DO NOT include markdown backticks.
         - DO NOT include any explanation.
-        - START the response directly with SELECT.
+        CRITICAL: The 'Context Schema' below describes TABLES and FIELDS, NOT the actual data rows. 
+        - DO NOT look for specific company names (like 'Apex' or 'Steel') in the schema text.
+        - ASSUME company names exist in the 'company_name' field of the 'Customer' or 'Vendor' tables.
+        - ASSUME item names exist in the 'item_name' field of the 'Item' tables.
         
         Context Schema:
         {schema_text}
@@ -119,28 +80,32 @@ class AILogicService:
         1. GRANULARITY: 
            - 'Purchase/Sale/Invoice' (without 'item/product') = Use Header tables (`PurchaseInvoice` or `SalesInvoice`) and `total_amount`.
            - 'Product/Item/Price' = Use Item tables (`PurchaseInvoiceItem` or `SalesInvoiceItem`) and `unit_price` or `total`.
-        2. PROFIT/LOSS (Net Income):
-           - Formula: (SUM of SalesInvoice.total_amount) - (SUM of PurchaseInvoice.total_amount).
-           - ALWAYS exclude Invoices with status='Cancelled'.
-        3. WORKING CAPITAL (Net):
-           - Formula: (Receivables) - (Payables). 
-           - Receivables: SUM of (SalesInvoice.total_amount - SalesInvoice.paid_amount) where status != 'Cancelled'.
-           - Payables: SUM of (PurchaseInvoice.total_amount - PurchaseInvoice.paid_amount) where status != 'Cancelled'.
-        4. ENTITY DIFFERENTIATION (CRITICAL):
-           - Customers and Vendors are DIFFERENT. 
-           - Customer info is in the `Customer` table. 
-           - Vendor info is in the `Vendor` table.
-           - If asked for names or counts of both, query BOTH tables (e.g. using UNION or separate subqueries). NEVER say they are indistinguishable.
-        5. CROSS-TABLE AGGREGATION (CRITICAL):
-           - NEVER use 'JOIN' between unrelated transaction tables (e.g. Sales vs Purchase).
-           - NEVER use 'JOIN ... ON TRUE'.
-           - ALWAYS use independent subqueries to avoid Cartesian products (duplication).
-        6. DATA TYPES & FUZZY SEARCH:
+        2. BALANCES & WORKING CAPITAL (CRITICAL):
+           - NEVER use 'outstanding_balance' or 'outstanding_payable' fields from Customer/Vendor tables (they may be stale).
+           - ALWAYS calculate balances by summing (total_amount - paid_amount) from Invoice tables.
+           - ALWAYS exclude status='Cancelled'.
+        3. NAME-BASED SEARCH & JOINS (CRITICAL):
+           - Invoices and Entities (Customer/Vendor) are Linked.
+           - When searching for a Company Name (e.g. 'Apex'), ALWAYS JOIN the transaction table to the Entity table.
+           - NEVER say a company is 'not found' without checking the Entity table first using ILIKE.
+        4. QUANTITY vs VALUE:
+           - "How many" or "Count of items" = Use SUM(quantity).
+           - "How much", "Worth", or "Total cost" = Use SUM(total).
+        5. CROSS-TABLE AGGREGATION (MANDATORY):
+           - NEVER 'JOIN' unrelated tables (e.g. SalesInvoice vs PurchaseInvoice).
+           - ALWAYS use the SUBQUERY pattern for 'Working Capital' or 'Profit/Loss'.
+           - CORRECT WORKING CAPITAL TEMPLATE: 
+             SELECT ( (SELECT SUM("total_amount" - "paid_amount") FROM "SalesInvoice" WHERE "status" != 'Cancelled') - (SELECT SUM("total_amount" - "paid_amount") FROM "PurchaseInvoice" WHERE "status" != 'Cancelled') ) as working_capital;
+        6. DATA TYPES & FUZZY SEARCH (ROBUST):
            - 'id' fields are UUID (TEXT). No 'id > 0' comparisons.
            - Use 'ILIKE %word%' for fuzzy item/customer searches.
+           - PLURAL RESILIENCE: If a user uses a plural word (e.g. "Steel Plates", "Aluminium Sheets"), ALWAYS use the singular stem in the SQL search (e.g. "item_name" ILIKE '%Steel%Plate%'). Singular DB records will NOT match plural search terms.
+        7. SELECTION EVIDENCE (CRITICAL):
+           - If the user filters by a name (e.g. Vendor Name or Item Name), you MUST include that name field in the SELECT clause (e.g. SELECT "Vendor"."company_name", ...). This allows the final response to confirm the match to the user.
         """
         
         try:
+            # Treating every query as standalone as per user request
             raw_sql = self._call_llama(system_sql_prompt, user_message).strip()
             
             # Post-processing: Extract only the SELECT statement if LLM included preamble
@@ -173,17 +138,26 @@ class AILogicService:
             print(f"DEBUG: Data Results for '{user_message}':\n{json.dumps(data_results, default=str)}")
 
             # Step 4: Synthesize Final Answer
-            system_synth_prompt = """
-            You are a helpful business assistant. Given a user's question and the raw data from the database, provide a clear, professional, and concise answer.
-            If the data is empty or null, say that no records were found.
-            Format numbers as currency (₹) where appropriate.
+            system_synth_prompt = f"""
+            You are a helpful business assistant for SNS (Working Capital platform).
+            Given a user's question and the raw data from the database, provide a clear, professional, and concise answer.
+            
+            Context Schema:
+            {schema_text}
+            
+            Business Rules:
+            1. Strictly distinguish "How many/Count" (Quantity) from "How much/Worth" (Currency ₹).
+            2. For quantities, do NOT use ₹.
+            3. TAX AWARENESS: The `total` field in the database usually includes TAX (e.g. 18% GST). If `quantity * unit_price` does not exactly match `total`, do NOT call it a "discrepancy". Just report the `total` as provided.
+            4. EVIDENTIARY TRUTH: If the user filters for a name (e.g. "Apex"), and data is returned, confirm it is from that entity. Do NOT say "it cannot be confirmed" if the SQL search was performed.
+            5. If the data results are empty, say clearly that no records were found for that specific search.
             """
             
             synth_user_prompt = f"""
             User Question: {user_message}
             Raw Data from DB: {json.dumps(data_results, default=str)}
             
-            Provide the final answer.
+            Provide the final answer based ONLY on the data provided.
             """
             
             final_answer = self._call_llama(system_synth_prompt, synth_user_prompt)
